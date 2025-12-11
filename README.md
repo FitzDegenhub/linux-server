@@ -8,7 +8,7 @@ Before you begin, ensure that you have:
 
 - A Linux-based system (Ubuntu 22.04+ or Debian 12+ recommended)
 - Minimum 8 GB RAM
-- Minimum 160 GB disk space
+- Minimum 40 GB disk space
 - A stable internet connection
 - Java 17 or higher installed
 
@@ -20,7 +20,7 @@ If you're running on a VPS, the following specifications are recommended:
 |----------|---------|-------------|
 | CPU | 2 vCores | 4 vCores |
 | RAM | 8 GB | 16 GB |
-| Storage | 160 GB SSD | 256 GB SSD |
+| Storage | 40 GB SSD | 80 GB SSD |
 | Network | 1 Gbps | 2.5 Gbps |
 | Transfer | 5 TB/month | Unlimited |
 

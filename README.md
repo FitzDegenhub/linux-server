@@ -431,7 +431,55 @@ Your node is now part of the Reality Network! 🎉
 
 ---
 
-## Create Transactions
+## create Transaction
+  ```bash
+  java -cp modules/wallet/target/scala-3.7.4/reality-wallet-assembly-*.jar \
+    org.reality.wallet.Main \
+    create-transaction \
+    --destination NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC \
+    --amount 100 --normalized \
+    --fee 0 \
+    --nextTxPath tx1.json \
+    --keystore kubernetes/data/genesis-keys/key-4.p12
+  ```
+
+For the second transaction (chain it to the previous):
+  ```bash
+  java -cp modules/wallet/target/scala-3.7.4/reality-wallet-assembly-*.jar \
+      org.reality.wallet.Main \
+      create-transaction \
+      --destination NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC \
+      --amount 50 --normalized \
+      --fee 0 \
+      --prevTxPath tx1.json \
+      --nextTxPath tx2.json \
+      --keystore kubernetes/data/genesis-keys/key-4.p12
+  ```
+
+
+Get last tx reference for an address:
+  ```bash
+  curl http://localhost:9010/transactions/last-reference/NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC
+  ```
+
+For a deploy app transaction:
+  ```bash
+  java -cp modules/wallet/target/scala-3.7.4/reality-wallet-assembly-*.jar \
+    org.reality.wallet.Main \
+    create-deploy-app-transaction \
+    --destination NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC \
+    --appDataPath kubernetes/data/genesis.csv \
+    --appName "MyToken" --appVersion "1.0" \
+    --appDescription "Token sale" --appDownloadURL "http://example.com/app.jar" \
+    --amount 0 --normalized --fee 0 \
+    --tokenTicker "TSALE" --totalSupply 1000 \
+    --tokenPrice 10 --tokensForSale 800 \
+    --totalRewards 200 --timeLimitOrdinalDiff 100 \
+    --nextTxPath deploy-tx.json \
+    --keystore kubernetes/data/genesis-keys/key-4.p12
+  ```
+
+## Send Transactions
   Standard transaction (send NET to someone):
   ```bash
   java -cp modules/tools/target/scala-3.7.4/reality-tools-assembly-*.jar org.reality.tools.Main \
@@ -442,7 +490,7 @@ Your node is now part of the Reality Network! 🎉
       --amount 100 --fee 0
   ```
 
-  Token sale:
+  Token sale/rApp Registration:
   ```bash
   java -cp modules/tools/target/scala-3.7.4/reality-tools-assembly-*.jar org.reality.tools.Main \
     send-deploy-app-transaction \
@@ -456,55 +504,6 @@ Your node is now part of the Reality Network! 🎉
     --tokenTicker "TSALE" --totalSupply 1000 \
     --tokenPrice 10 --tokensForSale 800 \
     --totalRewards 200 --timeLimitOrdinalDiff 100 --fee 0
-  ```
-
-  rApp registration:
-  ```bash
-  java -cp modules/tools/target/scala-3.7.4/reality-tools-assembly-*.jar org.reality.tools.Main \
-      send-rapp-registration-transaction \
-      --baseUrl localhost:9010 \
-      --walletPath kubernetes/data/genesis-keys/key-4.p12 \
-      --rappCoinbaseHash eeff4e5bbfcca3d84d0f819582f41dd1ec5a8651259bf9974ce0bcb0ed7a1bd1 \
-      --fee 0
-  ```
-
-
-
-## Send Transactions
-  ```bash
-  java -cp reality-tools-assembly-*.jar org.reality.tools.Main \
-      send-standard-transaction \
-      --baseUrl http://localhost:9010 \
-      --walletPath kubernetes/data/genesis-keys/key-4.p12 \
-      --destinationAddress NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC \
-      --amount 100 \
-      --fee 0
-  ```
-
-  For a deploy app transaction:
-  ```bash
-  java -cp reality-tools-assembly-*.jar org.reality.tools.Main \
-      send-deploy-app-transaction \
-      --baseUrl http://localhost:9010 \
-      --walletPath kubernetes/data/genesis-keys/key-4.p12 \
-      --destinationWalletPath kubernetes/data/genesis-keys/key-5.p12 \
-      --appName "MyToken" \
-      --appVersion "1.0" \
-      --appDescription "Token sale" \
-      --appDownloadUrl "http://example.com/app.jar" \
-      --appDataPath kubernetes/data/genesis.csv \
-      --tokenTicker "TSALE" \
-      --totalSupply 1000 \
-      --tokenPrice 10 \
-      --tokensForSale 800 \
-      --totalRewards 200 \
-      --timeLimitOrdinalDiff 100 \
-      --fee 0
-  ```
-
-  Get last tx reference for an address:
-  ```bash
-  curl http://localhost:9010/transactions/last-reference/NET8Yy2enxizZdWoipKKZg6VXwk7rY2Z54mJqUdC
   ```
 
 ## Node States

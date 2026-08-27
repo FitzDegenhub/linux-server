@@ -134,13 +134,15 @@ Reality Network node installer v$VERSION
 
   --ip ADDRESS        public IPv4 to advertise (default: detected)
   --password SECRET   keystore password (default: you are asked)
+  --keystore PATH     import this keystore instead of searching for one
   --heap SIZE         JVM heap, e.g. 6g (default: sized from RAM)
   --no-upgrade        skip the system package upgrade
   --no-firewall       do not touch ufw rules
   --no-auto-update    install the watchdog without automatic updates
   --allow-private     accept a private/LAN IP (for local testing only)
   --uninstall         remove the programs, keeping your keystore and data in /opt/reality
-  --purge             with --uninstall, also delete keystore and data
+  --purge             with --uninstall, also delete chain data and settings
+                      (your keystore is copied to /root first, never destroyed)
   -h, --help          this message
 
 USAGE
@@ -148,12 +150,14 @@ USAGE
 }
 
 PURGE=false
+IMPORT_KEYSTORE=""
 ALLOW_PRIVATE=false
 DO_UPGRADE=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --ip)             NODE_IP="${2:-}"; shift 2 ;;
         --password)       NODE_PASSWORD="${2:-}"; shift 2 ;;
+        --keystore)       IMPORT_KEYSTORE="${2:-}"; shift 2 ;;
         --heap)           HEAP="${2:-}"; shift 2 ;;
         --no-firewall)    DO_FIREWALL=false; shift ;;
         --no-upgrade)     DO_UPGRADE=false; shift ;;
@@ -185,8 +189,36 @@ if [[ $MODE == uninstall ]]; then
     rm -rf "$PREFIX/bin" "$PREFIX/releases" "$PREFIX/current" /usr/local/bin/reality /usr/local/bin/realityctl
     ok "programs removed"
     if [[ $PURGE == true ]]; then
+        # A keystore is a wallet: losing it is unrecoverable, so it is always
+        # rescued out of the way first, whatever the operator asked for.
+        RESCUE=""
+        if [[ -f $PREFIX/node.p12 ]]; then
+            RESCUE="/root/reality-keystore-$(date +%Y%m%d-%H%M%S)"
+            install -d -m 0700 "$RESCUE"
+            install -m 0600 "$PREFIX/node.p12" "$RESCUE/node.p12"
+            [[ -f $PREFIX/node.env ]] && install -m 0600 "$PREFIX/node.env" "$RESCUE/node.env"
+            if [[ -t 0 ]]; then
+                printf '\n   %s%s  This will delete %s, including your node identity.%s\n' "$Y" "$WARN" "$PREFIX" "$R"
+                printf '      %sIf you continue, a copy of your keystore is saved to%s\n' "$D" "$R"
+                printf '      %s%s first, so your wallet survives either way.%s\n\n' "$D" "$RESCUE" "$R"
+                read -r -p '   Type DELETE in capitals to continue, anything else to keep your data: ' ans
+                if [[ $ans != DELETE ]]; then
+                    rm -rf "$RESCUE"
+                    printf '\n'
+                    ok "your keystore and chain data are still in $PREFIX"
+                    note "the node itself is uninstalled - reinstall it with:"
+                    note "  sudo bash install.sh --keystore $PREFIX/node.p12"
+                    printf '\n'
+                    exit 0
+                fi
+            fi
+        fi
         rm -rf "$PREFIX"
-        warn "keystore and chain data deleted"
+        warn "chain data and settings deleted"
+        if [[ -n $RESCUE ]]; then
+            ok "your keystore was NOT destroyed $MID copied to $RESCUE"
+            note "it is your wallet - move it somewhere safe, or delete that folder yourself"
+        fi
     else
         ok "keystore, settings and data kept in $PREFIX"
         note "delete them with: sudo rm -rf $PREFIX"
@@ -420,6 +452,30 @@ rm -f "$REL"
 KEYSTORE="$DATA/node.p12"
 KEYALIAS=node
 
+# A keystore that was rescued or backed up alongside its node.env carries its
+# own password. Use it rather than making the operator remember one.
+password_beside(){
+    local envf; envf="$(dirname "$1")/node.env"
+    [[ -r $envf ]] || return 1
+    local pw; pw=$(awk -F= '/^CL_PASSWORD=/{sub(/^CL_PASSWORD=/,""); print}' "$envf" | tr -d '"')
+    [[ -n $pw ]] || return 1
+    printf '%s' "$pw"
+}
+
+# The old guide put the password in the service file's ExecStart. For anyone who
+# set their node up months ago, that file may be the only place it is written
+# down - so read it rather than asking them to remember it.
+password_from_unit(){
+    local unit pw
+    for unit in /etc/systemd/system/reality*.service; do
+        [[ -f $unit ]] || continue
+        grep -q '/opt/reality/current/core.jar' "$unit" && continue   # ours, not theirs
+        pw=$(grep -oE -- "--password[= ]+[^ '\"]+" "$unit" 2>/dev/null | head -1 | sed -E "s/^--password[= ]+//")
+        [[ -n $pw ]] && { printf '%s' "$pw"; return 0; }
+    done
+    return 1
+}
+
 find_old_keystores(){
     local pid cwd arg unit
     # 1. The running node: the --keystore it was started with is the one in use.
@@ -435,10 +491,44 @@ find_old_keystores(){
         [[ -f $unit ]] || continue
         grep -oE -- '--keystore[= ]+[^ '"'"']+' "$unit" 2>/dev/null | sed -E 's/^--keystore[= ]+//'
     done
-    # 3. Anything that looks like one, in the usual places.
-    find /root /home /opt /srv /var/lib -maxdepth 4 -type f -name '*.p12' \
-        -not -path "$PREFIX/*" 2>/dev/null
+    # 3. A keystore sitting in what is clearly a node directory. The jar or the
+    #    data/ folder beside it is what makes it a node rather than a backup:
+    #    people keep folders full of spare .p12 files, and importing one of those
+    #    would silently adopt the wrong identity.
+    local f dir
+    while read -r f; do
+        dir=$(dirname "$f")
+        if compgen -G "$dir/reality-*.jar" >/dev/null 2>&1 || [[ -d $dir/data ]]; then
+            printf '%s\n' "$f"
+        fi
+    done < <(find /root /home /opt /srv /var/lib -maxdepth 4 -type f -name '*.p12' \
+        -not -path "$PREFIX/*" 2>/dev/null)
 }
+
+# An explicit --keystore is always honoured, even if one is already installed.
+# The one being replaced is moved aside, never deleted.
+if [[ -n $IMPORT_KEYSTORE ]]; then
+    [[ -f $IMPORT_KEYSTORE ]] || die "No keystore at $IMPORT_KEYSTORE"
+    if [[ -f $KEYSTORE ]] && cmp -s "$IMPORT_KEYSTORE" "$KEYSTORE"; then
+        MIGRATED_FROM="$IMPORT_KEYSTORE"
+        ok "keystore already installed $MID $IMPORT_KEYSTORE"
+    else
+        sect "EXISTING NODE FOUND"
+        if [[ -f $KEYSTORE ]]; then
+            REPLACED="$PREFIX/node.p12.replaced-$(date +%Y%m%d-%H%M%S)"
+            mv "$KEYSTORE" "$REPLACED"
+            warn "a different keystore was installed here - kept as $(basename "$REPLACED")"
+        fi
+        install -m 0600 -o "$RUN_USER" -g "$RUN_USER" "$IMPORT_KEYSTORE" "$KEYSTORE"
+        MIGRATED_FROM="$IMPORT_KEYSTORE"
+        ok "keystore imported $MID the original is untouched"
+    fi
+    if [[ -z $NODE_PASSWORD ]] && NODE_PASSWORD=$(password_beside "$IMPORT_KEYSTORE"); then
+        ok "password read from the node.env beside it"
+    elif [[ -z $NODE_PASSWORD ]] && NODE_PASSWORD=$(password_from_unit); then
+        ok "password recovered from your old service file"
+    fi
+fi
 
 if [[ ! -f $KEYSTORE ]]; then
     mapfile -t FOUND < <(find_old_keystores | while read -r f; do [[ -f $f ]] && readlink -f "$f"; done | awk '!seen[$0]++')
@@ -449,16 +539,43 @@ if [[ ! -f $KEYSTORE ]]; then
             note "keystore at ${FOUND[0]}"
             if [[ -t 0 ]]; then
                 read -r -p '   Import it so you keep your node identity? [Y/n] ' ans
-                [[ ${ans:-Y} =~ ^[Nn] ]] || pick="${FOUND[0]}"
+                if [[ ${ans:-Y} =~ ^[Nn] ]]; then
+            printf '\n   %s%s  A new identity is a different wallet.%s\n' "$Y" "$WARN" "$R"
+            printf '      %sYour existing node has its own address, and any NET it holds or%s\n' "$D" "$R"
+            printf '      %searns stays with that address. A new identity starts from zero and%s\n' "$D" "$R"
+            printf '      %searns separately - a balance cannot be moved between them.%s\n' "$D" "$R"
+            printf '      %sYour old keystore is left untouched either way, so you can still%s\n' "$D" "$R"
+            printf '      %simport it later with:  sudo bash install.sh --keystore PATH%s\n\n' "$D" "$R"
+                    read -r -p "   Create a new identity anyway? [y/N] " ans2
+                    [[ ${ans2:-N} =~ ^[Yy] ]] || pick="${FOUND[0]}"
+                    [[ -n ${pick:-} ]] && ok "keeping your existing identity"
+                else
+                    pick="${FOUND[0]}"
+                fi
             else
-                pick="${FOUND[0]}"; note "importing (run in a terminal to be asked)"
+                note "not importing without a terminal to ask in"
+                note "to import it: sudo bash install.sh --keystore ${FOUND[0]}"
             fi
         else
             note "more than one keystore on this machine:"
             for i in "${!FOUND[@]}"; do printf '     %s%d%s  %s\n' "$B" $((i+1)) "$R" "${FOUND[$i]}"; done
             if [[ -t 0 ]]; then
                 read -r -p '   Import which one? [number, or n for a new identity] ' ans
-                [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#FOUND[@]} )) && pick="${FOUND[$((ans-1))]}"
+                if [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#FOUND[@]} )); then
+                    pick="${FOUND[$((ans-1))]}"
+                else
+                printf '\n   %s%s  A new identity is a different wallet.%s\n' "$Y" "$WARN" "$R"
+                printf '      %sYour existing node has its own address, and any NET it holds or%s\n' "$D" "$R"
+                printf '      %searns stays with that address. A new identity starts from zero and%s\n' "$D" "$R"
+                printf '      %searns separately - a balance cannot be moved between them.%s\n' "$D" "$R"
+                printf '      %sYour old keystore is left untouched either way, so you can still%s\n' "$D" "$R"
+                printf '      %simport it later with:  sudo bash install.sh --keystore PATH%s\n\n' "$D" "$R"
+                    read -r -p "   Create a new identity anyway? [y/N] " ans2
+                    if [[ ! ${ans2:-N} =~ ^[Yy] ]]; then
+                        read -r -p "   Import which one? [number] " ans3
+                        [[ $ans3 =~ ^[0-9]+$ ]] && (( ans3 >= 1 && ans3 <= ${#FOUND[@]} )) && pick="${FOUND[$((ans3-1))]}"
+                    fi
+                fi
             else
                 note "not asking without a terminal - a new identity will be created"
             fi
@@ -467,10 +584,12 @@ if [[ ! -f $KEYSTORE ]]; then
             install -m 0600 -o "$RUN_USER" -g "$RUN_USER" "$pick" "$KEYSTORE"
             MIGRATED_FROM="$pick"
             ok "keystore imported $MID the original is untouched"
+            if [[ -z $NODE_PASSWORD ]] && NODE_PASSWORD=$(password_beside "$pick"); then
+                ok "password read from the node.env beside it"
+            elif [[ -z $NODE_PASSWORD ]] && NODE_PASSWORD=$(password_from_unit); then
+                ok "password recovered from your old service file"
+            fi
             # Stop whatever was running it so it does not fight over the ports.
-            tmux kill-session -t reality >/dev/null 2>&1 && note "stopped the old tmux session" || true
-            systemctl stop reality-node.service >/dev/null 2>&1 || true
-            pkill -f 'run-validator' >/dev/null 2>&1 && note "stopped the old node process" || true
         else
             note "a new identity will be created"
         fi
@@ -478,12 +597,12 @@ if [[ ! -f $KEYSTORE ]]; then
 fi
 
 if [[ -f $KEYSTORE ]]; then
-    if [[ -f $ENVF ]]; then
+    if [[ -z $NODE_PASSWORD && -f $ENVF ]]; then
         NODE_PASSWORD=$(awk -F= '/^CL_PASSWORD=/{sub(/^CL_PASSWORD=/,""); print}' "$ENVF" | tr -d '"')
     fi
     if [[ -z $NODE_PASSWORD && -t 0 ]]; then
         printf '\n   Enter the password of your existing keystore.\n'
-        printf '   %s%s%s\n\n' "$D" "$KEYSTORE" "$R"
+        printf '   %s%s%s\n\n' "$D" "${MIGRATED_FROM:-$KEYSTORE}" "$R"
         read -r -s -p '   Password: ' NODE_PASSWORD; printf '\n\n'
     fi
     [[ -n $NODE_PASSWORD ]] || die "Found an existing keystore but no saved password." \
@@ -521,22 +640,33 @@ else
     ok "keystore created $MID $KEYSTORE"
 fi
 
-printf '   %s%s%s reading keystore ...' "$D" "$MID" "$R"
-ID_ERR=$(mktemp)
-NODE_ID=$(CL_KEYSTORE="$KEYSTORE" CL_KEYALIAS="$KEYALIAS" CL_PASSWORD="$NODE_PASSWORD" \
-    java -jar "$PREFIX/current/wallet.jar" show-id 2>"$ID_ERR" | tr -dc '0-9a-f' || true)
-printf '\r'
-if [[ ${#NODE_ID} -lt 64 ]]; then
+# A wrong password just means asking again, not starting the installer over.
+PW_TRY=0
+while :; do
+    printf '   %s%s%s reading keystore ...' "$D" "$MID" "$R"
+    ID_ERR=$(mktemp)
+    NODE_ID=$(CL_KEYSTORE="$KEYSTORE" CL_KEYALIAS="$KEYALIAS" CL_PASSWORD="$NODE_PASSWORD" \
+        java -jar "$PREFIX/current/wallet.jar" show-id 2>"$ID_ERR" | tr -dc '0-9a-f' || true)
+    printf '\r%72s\r' ""
+    if [[ ${#NODE_ID} -ge 64 ]]; then rm -f "$ID_ERR"; break; fi
+
     if grep -qiE 'password|mac|integrity|keystore' "$ID_ERR"; then
         rm -f "$ID_ERR"
+        PW_TRY=$(( PW_TRY + 1 ))
+        if [[ -t 0 ]] && (( PW_TRY < 5 )); then
+            printf '   %s%s%s that password does not open the keystore, try again\n' "$Y" "$WARN" "$R"
+            printf '   %s%s%s\n\n' "$D" "${MIGRATED_FROM:-$KEYSTORE}" "$R"
+            read -r -s -p '   Password: ' NODE_PASSWORD; printf '\n\n'
+            continue
+        fi
         die "That password does not open the keystore." \
-            "Run the installer again and enter the password you used when the keystore was created."
+            "It is the password used when the keystore was created, and it cannot be reset."
     fi
+
     printf '\n' >&2; sed 's/^/     /' "$ID_ERR" | tail -5 >&2
     rm -f "$ID_ERR"
     die "Could not read the node ID from the keystore."
-fi
-rm -f "$ID_ERR"
+done
 
 ok "node id $MID ${NODE_ID:0:8}${MID}${NODE_ID: -6}"
 
@@ -604,6 +734,14 @@ rm -f /usr/local/bin/realityctl   # earlier name
 ok "watchdog and reality installed"
 
 # --------------------------------------------------------------------- systemd
+
+# Their old unit may hold the only written copy of their password. Keep it.
+if [[ -f /etc/systemd/system/reality-node.service ]] \
+   && ! grep -q '/opt/reality/current/core.jar' /etc/systemd/system/reality-node.service; then
+    UNIT_BAK="/etc/systemd/system/reality-node.service.replaced-$(date +%Y%m%d-%H%M%S)"
+    cp /etc/systemd/system/reality-node.service "$UNIT_BAK"
+    note "your old service file was kept as $(basename "$UNIT_BAK")"
+fi
 
 cat > /etc/systemd/system/reality-node.service <<UNITEOF
 [Unit]
@@ -702,36 +840,84 @@ read_state(){
         | head -1 | sed -E 's/.*:[[:space:]]*"//; s/"$//'
 }
 
-# Anything else on our ports (an old hand-run node, for example) has to go first.
-if ss -ltn 2>/dev/null | grep -qE ":($PUBLIC_PORT|$P2P_PORT)\s" && ! systemctl is-active --quiet reality-node.service; then
-    tmux kill-session -t reality >/dev/null 2>&1 || true
-    pkill -f 'reality-core-assembly.*run-validator' >/dev/null 2>&1 || true
+# Only now, with the keystore imported and its password confirmed, is it safe to
+# stop whatever was running. Doing it earlier would leave an operator with a
+# stopped node if the install did not complete.
+if [[ -n ${MIGRATED_FROM:-} ]] || ss -ltn 2>/dev/null | grep -qE ":($PUBLIC_PORT|$P2P_PORT)\s"; then
+    # Whatever systemd unit is running the old node - it may not be called
+    # reality-node - has to be disabled, not just stopped. Restart=always would
+    # otherwise bring it straight back to fight over the ports, and it would
+    # start again on every boot.
+    for pid in $(pgrep -f 'run-validator' 2>/dev/null); do
+        oldunit=$(grep -oE '[A-Za-z0-9_.@-]+\.service' "/proc/$pid/cgroup" 2>/dev/null | head -1)
+        [[ -z ${oldunit:-} || $oldunit == reality-node.service ]] && continue
+        systemctl disable --now "$oldunit" >/dev/null 2>&1 && note "disabled the old service $oldunit"
+    done
+    tmux kill-session -t reality >/dev/null 2>&1 && note "stopped the old tmux session" || true
+    systemctl stop reality-node.service >/dev/null 2>&1 || true
+    pkill -f 'run-validator' >/dev/null 2>&1 || true
     sleep 3
+
+    # Reuse the chain the old node already downloaded rather than syncing from
+    # scratch. It is only a local copy of the chain, so if the new release cannot
+    # read it we fall back to a clean sync below.
+    if [[ -n ${MIGRATED_FROM:-} ]]; then
+        OLD_DATA="$(dirname "$MIGRATED_FROM")/data"
+        if [[ -d $OLD_DATA ]] && [[ ! -d $DATA/data || -z $(ls -A "$DATA/data" 2>/dev/null) ]]; then
+            OLD_DATA_SZ=$(du -sh "$OLD_DATA" 2>/dev/null | cut -f1)
+            printf '   %s%s%s reusing your existing chain data (%s) ...' "$D" "$MID" "$R" "${OLD_DATA_SZ:-?}"
+            rm -rf "$DATA/data"
+            if mv "$OLD_DATA" "$DATA/data" 2>/dev/null || cp -a "$OLD_DATA" "$DATA/data" 2>/dev/null; then
+                chown -R "$RUN_USER:$RUN_USER" "$DATA/data" 2>/dev/null || true
+                ADOPTED_DATA=1
+                printf '\r%72s\r' ""
+                ok "reusing your existing chain data ${OLD_DATA_SZ:+($OLD_DATA_SZ)} $MID no full resync"
+            else
+                printf '\r%72s\r' ""
+                warn "could not reuse the old chain data - the node will resync"
+            fi
+        fi
+    fi
     if ss -ltn 2>/dev/null | grep -qE ":($PUBLIC_PORT|$P2P_PORT)\s"; then
         die "Port $PUBLIC_PORT or $P2P_PORT is in use by another program." "Stop it, then run the installer again. Check with: sudo ss -ltnp | grep 900"
     fi
-    note "stopped the node that was already running by hand"
 fi
 
 systemctl enable reality-node.service    >/dev/null 2>&1
 systemctl enable reality-watchdog.timer  >/dev/null 2>&1
-systemctl restart reality-node.service
+start_and_wait(){
+    systemctl restart reality-node.service
+    printf '   %s%s%s starting node ...' "$D" "$MID" "$R"
+    STATE=""
+    local i
+    for i in $(seq 1 60); do
+        STATE=$(read_state) || STATE=""
+        [[ -n $STATE ]] && break
+        systemctl is-active --quiet reality-node.service || break
+        sleep 2
+    done
+    printf '\r%72s\r' ""
+    [[ -n $STATE ]]
+}
 
-printf '   %s%s%s starting node ...' "$D" "$MID" "$R"
-STATE=""
-for i in $(seq 1 60); do
-    STATE=$(read_state) || STATE=""
-    [[ -n $STATE ]] && break
-    if ! systemctl is-active --quiet reality-node.service; then
-        printf '\r'
+if ! start_and_wait; then
+    if [[ -n ${ADOPTED_DATA:-} ]]; then
+        # The old chain data is the most likely reason, and it is replaceable.
+        warn "the node would not start with the old chain data"
+        mv "$DATA/data" "$DATA/data-unusable-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || rm -rf "$DATA/data"
+        note "set it aside - starting again with a fresh sync"
+        ADOPTED_DATA=""
+        start_and_wait || {
+            printf '\n   %s%s the node stopped while starting up%s\n\n' "$E" "$NO" "$R" >&2
+            journalctl -u reality-node.service -n 15 --no-pager | sed 's/^/     /' >&2
+            exit 1
+        }
+    else
         printf '\n   %s%s the node stopped while starting up%s\n\n' "$E" "$NO" "$R" >&2
         journalctl -u reality-node.service -n 15 --no-pager | sed 's/^/     /' >&2
         exit 1
     fi
-    sleep 2
-done
-printf '\r'
-[[ -n $STATE ]] || die "The node did not answer on port $PUBLIC_PORT." "Check: journalctl -u reality-node -n 50"
+fi
 ok "node running $MID state $STATE                 "
 
 systemctl start reality-watchdog.timer >/dev/null 2>&1
@@ -771,6 +957,15 @@ printf '   %s%s  Back up %s%s\n' "$Y" "$WARN" "$KEYSTORE$R" ""
 printf '      %sit is your node identity and cannot be recovered.%s\n' "$D" "$R"
 printf '      %sRemember your password - it is also kept in %s%s\n' "$D" "$ENVF" "$R"
 printf '\n'
+if [[ -n ${MIGRATED_FROM:-} ]]; then
+    OLD_DIR=$(dirname "$MIGRATED_FROM")
+    if [[ -d $OLD_DIR && $OLD_DIR != "$PREFIX" ]]; then
+        OLD_SZ=$(du -sh "$OLD_DIR" 2>/dev/null | cut -f1)
+        note "your old node is still in $OLD_DIR (${OLD_SZ:-?}), untouched"
+        note "delete it once you are happy: sudo rm -rf $OLD_DIR"
+        printf '\n'
+    fi
+fi
 printf '   %sYOUR COMMANDS%s\n' "$B" "$R"
 printf '   reality status          how your node is doing\n'
 printf '   reality logs            watch the node log live   %s(Ctrl-C to leave, node keeps running)%s\n' "$D" "$R"
@@ -789,16 +984,19 @@ printf '\n'
 
 if [[ -f /var/run/reboot-required ]]; then
     warn "the system upgrade needs a reboot to finish"
-    note "your node will start again by itself after the reboot"
+    note "your node starts again by itself after the reboot - nothing to run"
+    note "log back in a few minutes later and type: reality status"
     if [[ -t 0 ]]; then
         read -r -p '   Reboot now? [Y/n] ' ans
         if [[ ! ${ans:-Y} =~ ^[Nn] ]]; then
-            printf '   %srebooting ...%s\n\n' "$D" "$R"
+            printf '\n   %srebooting - see you on the other side%s\n\n' "$D" "$R"
             sleep 2
             systemctl reboot
+        else
+            note "reboot when convenient with: sudo reboot"
         fi
     else
-        note "reboot when convenient: sudo reboot"
+        note "reboot when convenient with: sudo reboot"
     fi
     printf '\n'
 fi
